@@ -5,16 +5,17 @@ Entry points:
 - ``open_page()``  — interactive: open and return a ``PageSession`` you close
   yourself.
 
-``PageSession`` exposes:
-- ``await session.get_html(sport=...)``  — navigate to a sport's live page (if
-  given) and return the rendered HTML.
-- ``await session.get_odds(sport=...)``  — same navigation, then scrape every
-  visible odds cell into a long-format DataFrame.
+``PageSession`` opens one browser tab per sport on demand. It exposes:
+
+- ``await session.open_sport("basketball")``  — pre-open a tab for a sport.
+- ``await session.get_html(sport=...)``        — raw HTML for that sport's tab.
+- ``await session.get_odds(sport=...)``        — scrape the sport's tab into a
+  per-event DataFrame and write a parquet snapshot under ``data/snapshots/``.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from playwright.async_api import (
 URL_BASE = "https://www.betsson.lt/en/live-betting"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_SCREENSHOT = _PROJECT_ROOT / "data" / "betsson.png"
+_SNAPSHOTS_DIR = _PROJECT_ROOT / "data" / "snapshots"
 
 _ODDS_COLUMNS = [
     "scraped_at",
@@ -147,55 +149,115 @@ _JS_EXTRACT_ODDS = """
 
 @dataclass
 class PageSession:
-    """An open Playwright page. Call ``await session.close()`` when done."""
+    """An open Playwright session with one tab per sport.
+
+    The initial ``page`` lands on the live-betting hub. Per-sport tabs are
+    created on demand (or up-front via ``open_sport``); each call to
+    ``get_odds`` / ``get_html`` is routed to the tab matching its ``sport``
+    argument. Call ``await session.close()`` when done.
+    """
 
     playwright: Playwright
     browser: Browser
     context: BrowserContext
     page: Page
     screenshot: Path
+    tabs: dict[str, Page] = field(default_factory=dict)
+    snapshots_dir: Path = field(default=_SNAPSHOTS_DIR)
 
     async def close(self) -> None:
-        await self.context.close()
-        await self.browser.close()
+        for tab in list(self.tabs.values()):
+            try:
+                if not tab.is_closed():
+                    await tab.close()
+            except Exception:
+                pass
+        self.tabs.clear()
+        try:
+            await self.context.close()
+        except Exception:
+            pass
+        try:
+            await self.browser.close()
+        except Exception:
+            pass
         await self.playwright.stop()
 
+    async def open_sport(self, sport: str) -> Page:
+        """Open *sport*'s live-betting page in a new browser tab (or return
+        the existing tab if already open). Brings the tab to the front."""
+        return await self._page_for_sport(sport)
+
     async def get_html(self, sport: str | None = None) -> str:
-        """Return the current HTML. If *sport* is given, navigate to that
-        sport's live-betting page first (e.g. ``"basketball"``)."""
-        await self._ensure_sport(sport)
-        return await self.page.content()
+        """Return the current HTML of *sport*'s tab (or the landing page)."""
+        page = await self._page_for_sport(sport)
+        return await page.content()
 
-    async def get_odds(self, sport: str | None = None) -> pd.DataFrame:
-        """Scrape odds while scrolling through the live-events container.
+    async def get_odds(
+        self,
+        sport: str | None = None,
+        save: bool = True,
+    ) -> pd.DataFrame:
+        """Scrape odds for *sport* and save a parquet snapshot.
 
-        If *sport* is given, navigate to its live-betting page first. Then
-        scrape the visible odds, scroll down one step, scrape again, and
-        repeat until the container reaches the bottom (or a safety cap).
-        Each step's odds are pivoted into a per-event DataFrame; all chunks
-        are concatenated and de-duplicated by ``event_id`` at the end.
-        Finally scroll back to the top.
+        Routes to *sport*'s dedicated tab (creating it if needed). Snapshots
+        odds at the top of the events container, scrolls down one step,
+        snapshots again, repeats until the bottom is reached, then scrolls
+        back to the top. Per-step DataFrames are concatenated and
+        de-duplicated by ``event_id`` (``keep="first"``).
 
-        Returns one row per event. Empty DataFrame with the right columns
-        if no events are found.
+        If ``save=True`` (default) and the result is non-empty, appends the
+        DataFrame to ``data/snapshots/betsson_<sport>.parquet`` (creating it
+        if missing) — one file per (bookmaker, sport).
         """
-        await self._ensure_sport(sport)
-        dfs = await self._scroll_and_scrape(sport=sport)
+        page = await self._page_for_sport(sport)
+        sport_label = sport or _sport_from_url(page.url)
+        dfs = await self._scroll_and_scrape(page=page, sport=sport_label)
+
         if not dfs:
-            return _rows_to_df([], sport_hint=sport, page_url=self.page.url)
-        df = pd.concat(dfs, ignore_index=True)
-        if df.empty:
-            return df
-        return df.drop_duplicates(subset=["event_id"], keep="first").reset_index(drop=True)
+            df = _rows_to_df([], sport_hint=sport_label, page_url=page.url)
+        else:
+            df = pd.concat(dfs, ignore_index=True)
+            if not df.empty:
+                df = df.drop_duplicates(subset=["event_id"], keep="first").reset_index(drop=True)
+
+        if save and not df.empty:
+            _save_snapshot(df, sport=sport_label, out_dir=self.snapshots_dir)
+        return df
+
+    async def _page_for_sport(self, sport: str | None) -> Page:
+        if not sport:
+            return self.page
+        cached = self.tabs.get(sport)
+        if cached and not cached.is_closed():
+            try:
+                await cached.bring_to_front()
+                return cached
+            except Exception:
+                # tab is dead or detached; fall through to recreate
+                pass
+        tab = await self.context.new_page()
+        await tab.goto(_url_for_sport(sport), wait_until="domcontentloaded")
+        try:
+            await tab.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+        try:
+            await tab.bring_to_front()
+        except Exception:
+            pass
+        self.tabs[sport] = tab
+        return tab
 
     async def _scroll_and_scrape(
         self,
+        page: Page,
         sport: str | None,
         max_iterations: int = 40,
         step_px: int = 300,
         step_delay_ms: int = 700,
     ) -> list[pd.DataFrame]:
-        """Scroll the events container down in steps, scraping at each step.
+        """Scroll *page*'s events container down in steps, scraping at each step.
 
         Returns the list of per-step DataFrames (one entry per scroll
         position, including the initial top-of-page snapshot). After
@@ -203,36 +265,23 @@ class PageSession:
         """
         dfs: list[pd.DataFrame] = []
 
-        # initial snapshot at the top before any scrolling
-        raw = await self.page.evaluate(_JS_EXTRACT_ODDS)
-        dfs.append(_rows_to_df(raw, sport_hint=sport, page_url=self.page.url))
+        raw = await page.evaluate(_JS_EXTRACT_ODDS)
+        dfs.append(_rows_to_df(raw, sport_hint=sport, page_url=page.url))
 
         last_top: int | None = None
         for _ in range(max_iterations):
-            result = await self.page.evaluate(_JS_SCROLL_STEP, {"stepPx": step_px})
-            await self.page.wait_for_timeout(step_delay_ms)
-            raw = await self.page.evaluate(_JS_EXTRACT_ODDS)
-            dfs.append(_rows_to_df(raw, sport_hint=sport, page_url=self.page.url))
+            result = await page.evaluate(_JS_SCROLL_STEP, {"stepPx": step_px})
+            await page.wait_for_timeout(step_delay_ms)
+            raw = await page.evaluate(_JS_EXTRACT_ODDS)
+            dfs.append(_rows_to_df(raw, sport_hint=sport, page_url=page.url))
             cur_top = result.get("scrollTop") if isinstance(result, dict) else None
             if cur_top is not None and cur_top == last_top:
                 break
             last_top = cur_top
 
-        await self.page.evaluate(_JS_SCROLL_TOP)
-        await self.page.wait_for_timeout(400)
+        await page.evaluate(_JS_SCROLL_TOP)
+        await page.wait_for_timeout(400)
         return dfs
-
-    async def _ensure_sport(self, sport: str | None) -> None:
-        if not sport:
-            return
-        target = _url_for_sport(sport)
-        if self.page.url.rstrip("/") == target.rstrip("/"):
-            return
-        await self.page.goto(target, wait_until="domcontentloaded")
-        try:
-            await self.page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
 
 
 async def open_page(
@@ -298,6 +347,29 @@ def _selection_label(col_label: str) -> str:
         "result_away": "away",
         "result_draw": "draw",
     }.get(col_label, col_label or "unknown")
+
+
+def _safe_sport_slug(sport: str) -> str:
+    """Sanitise a sport name for use in a filename."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", sport).strip("_") or "unknown"
+
+
+def _save_snapshot(df: pd.DataFrame, sport: str, out_dir: Path) -> Path:
+    """Append *df* to ``betsson_<sport>.parquet`` (creating it if missing).
+
+    There is one file per (bookmaker, sport). Each scrape appends its rows;
+    each row's ``scraped_at`` distinguishes snapshots over time.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = _safe_sport_slug(sport)
+    path = out_dir / f"betsson_{slug}.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+        combined = pd.concat([existing, df], ignore_index=True)
+    else:
+        combined = df
+    combined.to_parquet(path, index=False)
+    return path
 
 
 def _rows_to_df(

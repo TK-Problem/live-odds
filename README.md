@@ -11,17 +11,23 @@ uv run playwright install chromium
 sudo uv run playwright install-deps chromium
 ```
 
-Then open `testing/debug_betsson.ipynb` and run the cells top to bottom.
+Then open `live_scraping/scrape_betsson.ipynb` for the main scraping flow, `investigate_odds/investigate_betsson.ipynb` to analyse the resulting parquet files, or `testing/debug_betsson.ipynb` for inspecting raw HTML.
 
 ## Layout
 
 ```
 scrapers/
   betsson/
-    page.py            # PageSession + open_page() / load_page()
+    page.py                   # PageSession + open_page() / load_page()
+live_scraping/
+  scrape_betsson.ipynb        # main UI: tabs per sport, scrape on demand, parquet snapshots
+investigate_odds/
+  investigate_betsson.ipynb   # read snapshot parquet files, explore odds movement
 testing/
-  debug_betsson.ipynb  # interactive UI: open browser, scrape odds, close
-data/                  # screenshots
+  debug_betsson.ipynb         # raw-HTML inspection
+data/
+  betsson.png                 # last screenshot from open_page()
+  snapshots/                  # one parquet file per (bookmaker, sport); appended to on each scrape
 ```
 
 Add new bookmakers as sibling packages under `scrapers/` (e.g. `scrapers/topsport/page.py`).
@@ -31,18 +37,22 @@ Add new bookmakers as sibling packages under `scrapers/` (e.g. `scrapers/topspor
 ```python
 from scrapers.betsson.page import open_page
 
-# Opens a Chromium window (headless=False by default), navigates to the
-# live-betting page, screenshots, and returns a session you control.
+# Open Chromium (headless=False by default), land on the live-betting hub.
 session = await open_page(headless=False)
 
-# Navigate to a sport's live page, scroll through the inner events panel,
-# scrape odds at each scroll step, and return one row per event.
+# Pre-open a tab per sport — each gets its own browser tab.
+for sport in ("basketball", "football", "tennis"):
+    await session.open_sport(sport)
+
+# Scrape any sport's tab. Each call:
+#  - scrolls the events container top→bottom→top, scraping at each step
+#  - concatenates per-step snapshots, dedups by event_id
+#  - appends rows to data/snapshots/betsson_<sport>.parquet
 df = await session.get_odds(sport="basketball")
 
-# Or just get the rendered HTML (also accepts sport=...).
+# Or just get the rendered HTML for that tab.
 html = await session.get_html(sport="basketball")
 
-# When done:
 await session.close()
 ```
 
@@ -52,14 +62,29 @@ await session.close()
 
 `betsson.lt` renders live events inside an inner scrollable container, and items outside the viewport may not be in the DOM. So `get_odds`:
 
-1. Navigates to the sport URL if `sport=...` is given.
+1. Routes to the sport's tab (creating it if needed).
 2. Snapshots odds at the top of the events container.
 3. Scrolls the container down by 300 px, waits 700 ms for new rows to mount, snapshots again.
 4. Repeats up to 40 times, stopping when `scrollTop` stops changing.
 5. Scrolls back to the top.
 6. Concatenates every snapshot and drops duplicates by `event_id` (`keep="first"`).
+7. If non-empty and `save=True` (default), appends to `data/snapshots/betsson_<sport>.parquet`.
 
 The scroll target is auto-detected — the closest scrollable ancestor of the first `section.wel-tournament`. Falls back to window scrolling if no inner container is found.
+
+## Snapshot files
+
+There is one parquet file per (bookmaker, sport):
+
+```
+data/snapshots/betsson_basketball.parquet
+data/snapshots/betsson_football.parquet
+data/snapshots/betsson_tennis.parquet
+```
+
+Every `get_odds(sport=X)` call (with `save=True`, the default) **appends** that scrape's rows to its sport's file (creating it the first time). Each row's `scraped_at` UTC timestamp distinguishes snapshots over time, so you can analyse odds movement by filtering on `scraped_at`. Pass `save=False` to skip the write.
+
+Sports never share files — `betsson_basketball.parquet` only contains basketball rows.
 
 ## DataFrame schema
 
